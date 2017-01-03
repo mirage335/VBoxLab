@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+#Developed and tested with VirtualBox version 4.1.4 on Linux host. Other configurations may be undefined.
+
+# Copyright (c) 2017 mirage335
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+##Utility functions.
+
+#Retrieves absolute path of current script, while maintaining symlinks, even when "./" would translate with "readlink -f" into something disregarding symlinked components in $PWD.
+#However, will dereference symlinks IF the script location itself is a symlink. This is to allow symlinking to scripts to function normally.
+#Suitable for allowing scripts to find other scripts they depend on. May look like an ugly hack, but it has proven reliable over the years.
+getScriptAbsoluteLocation() {
+	local absoluteLocation
+	if [[ (-e $PWD\/$0) && ($0 != "") ]]
+			then
+	absoluteLocation="$PWD"\/"$0"
+	absoluteLocation=$(realpath -s "$absoluteLocation")
+			else
+	absoluteLocation="$0"
+	fi
+
+	if [[ -h "$absoluteLocation" ]]
+			then
+	absoluteLocation=$(readlink -f "$absoluteLocation")
+	fi
+
+	echo $absoluteLocation
+}
+
+#Retrieves absolute path of current script, while maintaining symlinks, even when "./" would translate with "readlink -f" into something disregarding symlinked components in $PWD.
+#Suitable for allowing scripts to find other scripts they depend on.
+getScriptAbsoluteFolder() {
+	dirname "$(getScriptAbsoluteLocation)"
+}
+
+#Portable sanity checked "rm -r" command.
+#"$1" == directory to remove
+_safeRMR() {
+	if [[ ! -e "$0" ]]
+	then
+		return 1
+	fi
+	
+	if [[ "$1" == "" ]]
+	then
+		return 1
+	fi
+	
+	if [[ "$1" == "/" ]]
+	then
+		return 1
+	fi
+		
+	if [[ -e "$1" ]]
+	then
+		rm --preserve-root --one-file-system --recursive "$1"
+		#rm -r "$1"
+	fi
+}
+
+_unique() {
+	cat /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 18
+}
+
+_fail() {
+	echo -e '\E[1;33;41mFAIL.\E[0m'
+	exit
+}
+
+_pass() {
+	echo -e '\E[1;32;46mPASS.\E[0m'
+}
+
+_waitVar() {
+	while [[ -e "$varStore".lck ]]
+	do
+		sleep 1
+	done
+}
+
+_saveVar() {
+	_waitVar
+	
+	touch "$varStore".lck
+	declare -p sessionid | sed 's/^declare/declare -g/g' > "$varStore"
+	#declare -p sessionid scriptAbsoluteFolder | sed 's/^declare/declare -g/g' > "$varStore"
+	rm "$varStore".lck
+	
+	
+}
+
+_clearVar() {
+	_waitVar
+	
+	touch "$varStore".lck
+	rm ./"$varStore"
+	rm "$varStore".lck
+}
+
+_loadVar() {
+	_waitVar
+	
+	if [[ ! -e "$varStore" ]]
+	then
+		return 1
+	fi
+	
+	touch "$varStore".lck
+	[[ -e "$varStore" ]] && . "$varStore"
+	rm "$varStore".lck
+	
+	#if [[ "$scriptAbsoluteFolder" != "$(getScriptAbsoluteFolder)" ]]
+	#then
+	#	rm ./"$varStore"
+	#	_fail
+	#fi
+	
+}
+
+##Global variables.
+export sessionid=$(_unique)
+export scriptAbsoluteFolder="$(getScriptAbsoluteFolder)"
+
+export dataDir="$scriptAbsoluteFolder"/instance
+export varStore="$dataDir"/varStore
+
+_loadVar
+
+export VBOX_USER_HOME="$scriptAbsoluteFolder"/vBoxCfg
+export VBOX_USER_HOME_full="$scriptAbsoluteFolder"/vBoxHome
+export VBOX_USER_HOME_short=/tmp/vBoxHome-"$sessionid"
+export VBOX_IPC_SOCKETID=$sessionid
+export VBoxXPCOMIPCD_PIDfile="/tmp/.vbox-""$VBOX_IPC_SOCKETID""-ipc/lock"
+
+##Internal functions.
+
+#Start/stop/cleanup/terminate.
+_prepare() {
+	mkdir -p "$dataDir"
+	mkdir -p "$VBOX_USER_HOME"
+	mkdir -p "$VBOX_USER_HOME_full"
+	ln -sf "$VBOX_USER_HOME_full" "$VBOX_USER_HOME_short"
+	
+	touch "$varStore"
+}
+
+_start() {
+	_prepare
+	
+	_saveVar
+}
+
+_stop() {
+	_saveVar
+	
+	exit
+}
+
+##VBox Boxing
+_wait() {
+	VBoxXPCOMIPCD_PID=$(cat "$VBoxXPCOMIPCD_PIDfile" 2> /dev/null)
+	echo -e '\E[1;32;46mWaiting for VBoxXPCOMIPCD to finish... \E[0m'
+	while kill -0 "$VBoxXPCOMIPCD_PID" > /dev/null 2>&1
+	do
+		sleep 1
+	done
+	_pass
+}
+
+_remove() {
+	echo -e '\E[1;32;46mRemoving IPC folder and vBoxHome directory symlink from filesystem.\E[0m'
+	
+	rm -v /tmp/\.vbox-"$VBOX_IPC_SOCKETID"-ipc/ipcd > /dev/null 2>&1
+	rm -v /tmp/\.vbox-"$VBOX_IPC_SOCKETID"-ipc/lock > /dev/null 2>&1
+	rmdir -v /tmp/\.vbox-"$VBOX_IPC_SOCKETID"-ipc > /dev/null 2>&1
+	
+	rm -v "$VBOX_USER_HOME_short" > /dev/null 2>&1
+	
+	_pass
+}
+
+
+_create() {
+	_start
+	
+	cd "$scriptAbsoluteFolder"
+	
+	env HOME="$VBOX_USER_HOME_short" VirtualBox
+	
+	_wait
+	
+	_remove
+	
+	_stop
+}
+
+_connectSSH() {
+	ssh -q -F ./sshconfig -i ./id_rsa "$1"
+}
+
+
+##Hooks.
+
+#Override functions with external definitions from a separate file if available.
+if [[ -e "./ops" ]]
+then
+	. ./ops
+fi
+
+#Launch internal functions as commands.
+if [[ "$1" != "" ]] && [[ "$1" != "-"* ]]
+then
+	"$@"
+	exit "$?"
+	#_stop "$?"
+fi
+
+#Stop if script is imported into an existing shell.
+if [[ "${BASH_SOURCE[0]}" != "${0}" ]]
+then
+	return
+fi
+
+
+##Default code.
+
+_create
+
+
+
